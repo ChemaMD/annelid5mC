@@ -1,0 +1,1230 @@
+######################################################################
+## Mapping WGBS or EM-seq samples
+######################################################################
+
+# Trim reads with fastp
+fastp -i WGBS_R1.fastq -I WGBS_R2.fastq -o WGBS_trimmed_R1.fastq.gz -O WGBS_trimmed_R2.fastq.gz
+
+# Index Genome
+bismark_genome_preparation --bowtie2 --parallel 4 --verbose /PATH/genome
+
+# Alignment
+bismark --genome_folder /PATH/genome -1 WGBS_trimmed_R1.fastq.gz -2 WGBS_trimmed_R2.fastq.gz -multicore 8
+
+# Deduplication
+deduplicate_bismark --bam -o WGBS.bam --paired WGBS_trimmed_R1_bismark_bt2_pe.bam
+
+# Call methylation in all CpG context
+bismark_methylation_extractor --gzip --CX --bedGraph --no_overlap --scaffolds --comprehensive --merge_non_CpG --cytosine_report -o all-context_methylation WGBS.deduplicated.bam --genome_folder /PATH/genome --multicore 5
+
+# Convert Bismark output into CGmap
+cgmaptools convert bismark2cgmap -i all_context.txt -o output.CGmap.gz
+
+
+######################################################################
+## Read CGmap into R, convert into bsseq objects and store as RDS
+## Workflow demonstrated using Owenia fusiformis as an example
+######################################################################
+
+library(data.table)
+library(stringr)
+library(dplyr)
+library(tidyverse)
+library(bsseq)
+library(ggplot2)
+library(GenomicRanges)
+library(R.utils)
+library(reshape2)
+library(ggseqlogo)
+library(cowplot)
+
+
+# Obtain fai index for genomes of each species using samtools and then import into R as follows:
+genome_fai <- fread(file = "Owenia_unmasked_v082020.fa.fai")[,c(1,2)]
+sLengths <- genome_fai$V2
+names(sLengths) <- genome_fai$V1
+
+# Function to read CGmap files, turn it into bsseq objects and then save as RDS objects:
+read_CGmap_into_CG_lambda_mito_files <- function(CGmap, name){
+  # 1. Read the file
+  dat <- fread(input = CGmap, sep = "\t", select = c(1,2,3,4,5,7,8),
+               col.names = c("chr", "base", "position", "context","dinucleotide",
+                             "C_reads", "CT_reads"))
+  # 2. Subset to CG context only, excluding positive & negative controls
+  datCG <- dat[dat$context == "CG" & !(dat$chr %in% c("chrL","pUC19", "chrM")), ]
+  
+  datCG$strand <- ifelse(test = datCG$base == "G",
+                         yes = "-",
+                         no = "+")
+  # 3. Turn dat into a bsseq object
+  bs_obj <- BSseq(gr = GRanges(seqnames = datCG$chr,
+                               ranges = IRanges(start = as.numeric(datCG$position),
+                                                end = as.numeric(datCG$position)), strand = datCG$strand, seqlengths = sLengths),
+                  sampleNames = name, M = as.matrix(datCG$C_reads), Cov = as.matrix(datCG$CT_reads),
+                  rmZeroCov = FALSE)
+  # 3.1 bsseq strand collapse
+  bs_obj_collapsed <- strandCollapse(bs_obj)
+  # 4. Remove datCG - no longer needed
+  rm(datCG)
+  
+  #save bsseq object
+  saveRDS(object = bs_obj_collapsed, file = paste0(name,".CG_bsseq.rds"))
+  
+  #Next, process the positive & negative controls:
+  # 5. Subset chrL
+  dat_Lambda <- dat[dat$chr == "chrL", ]
+  
+  # 5.1 Add species name in a new column
+  dat_Lambda$species <- name
+  
+  #save lambda genome
+  saveRDS(object = dat_Lambda, file = paste0(name,".lambda.rds"))
+  
+  # 6. Subset chrM
+  dat_mito <- dat[dat$chr == "chrM", ]
+  
+  # 6.1 Add species name in a new column
+  dat_mito$species <- name
+  
+  #save mitochondrial genome
+  saveRDS(object = dat_mito, file = paste0(name,".mito.rds"))
+  
+  # 7. Subset pUC19
+  dat_puc <- dat[dat$chr == "pUC19", ]
+  
+  # 7.1 Add species name in a new column
+  dat_puc$species <- name
+  
+  #save pUC19 genome
+  saveRDS(object = dat_puc, file = paste0(name,".pUC19.rds"))
+  
+  #Lastly,
+  gc()
+}
+
+# Read CGmap files for each sample as follows:
+# This will automatically output RDS objects into the designated folder
+read_CGmap_into_CG_lambda_mito_files(CGmap = "ofus.gastrula.WGBS.CGmap.gz", name = "ofus_gastrula_WGBS")
+read_CGmap_into_CG_lambda_mito_files(CGmap = "ofus.larva.WGBS.CGmap.gz", name = "ofus_larva_WGBS")
+read_CGmap_into_CG_lambda_mito_files(CGmap = "ofus.adult.WGBS.CGmap.gz", name = "ofus_adult_WGBS")
+
+# Import the nuclear CpG bsseq objects:
+oweGastrula_bs_obj <- readRDS("ofus_gastrula_WGBS.CG_bsseq.rds")
+oweLarva_bs_obj <- readRDS("ofus_larva_WGBS.CG_bsseq.rds")
+oweAdult_bs_obj <- readRDS("ofus_adult_WGBS.CG_bsseq.rds")
+
+#Combine all developmental stages:
+owe_dev_bs_obj <- bsseq::combine(oweGastrula_bs_obj, oweLarva_bs_obj, oweAdult_bs_obj)
+#save the combined bsseq object 
+saveRDS(owe_dev_bs_obj, file = "OweniaMethylomesBSseq.obj.rds")
+
+
+######################################################################
+## Calculate global mCG levels and CpG proportions
+######################################################################
+
+# Function to obtain global mCG levels and methylated CpG proportions
+mCG_to_Oz_proportions <- function(bsobj){
+  bs <- readRDS(bsobj)
+  
+  #filter for 10x coverage
+  ten_x_covered_CGs <- getMeth(bs, type = "raw")[getCoverage(bs, type = "Cov") >= 10, 1]
+  rm(bs)
+  gc()
+  
+  #count positions
+  none <- sum(ten_x_covered_CGs == 0) / length(ten_x_covered_CGs)
+  low <- sum(ten_x_covered_CGs >0 & ten_x_covered_CGs <=0.2) / length(ten_x_covered_CGs)
+  inter <- sum(ten_x_covered_CGs >0.2 & ten_x_covered_CGs <=0.8) / length(ten_x_covered_CGs)
+  high <- sum(ten_x_covered_CGs >0.8) / length(ten_x_covered_CGs)
+  
+  df <- data.frame(type = c("none","low","inter","high"),
+                   species = str_split(bsobj, pattern = "\\.", simplify = T)[1],
+                   proportion = c(none, low, inter, high)) %>%
+    mutate(perc = round(proportion*100, digits = 2))
+  return(df)
+}
+
+
+mCGProportions <- rbind(mCG_to_Oz_proportions(bsobj = "ofus_gastrula_WGBS.bsseq.rds"),
+                        mCG_to_Oz_proportions(bsobj = "ofus_larva_WGBS.bsseq.rds"),
+                        mCG_to_Oz_proportions(bsobj = "ofus_adult_WGBS.bsseq.rds"))
+mCGProportions$type <- factor(mCGProportions$type, levels = c("none","low","inter","high"))
+mCGProportions$species <- factor(mCGProportions$species, levels = c("ofus_gastrula_WGBS",
+                                                                    "ofus_larva_WGBS",
+                                                                    "ofus_adult_WGBS"))
+
+
+# Global methylation levels for Owenia samples
+global <- colSums(getCoverage(owe_dev_bs_obj,type = "M"))/colSums(getCoverage(owe_dev_bs_obj,type = "Cov")) %>% 
+  data.frame() %>% dplyr::rename(mCG = ".")
+global$sample <- rownames(global)
+
+global$sample <- factor(global$sample, levels = c("ofus_gastrula_WGBS",
+                                                  "ofus_larva_WGBS",
+                                                  "ofus_adult_WGBS"))
+
+# Plot
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+ggplot(data = mCGProportions, aes(x = as.factor(species),y = perc, fill = type)) + 
+  geom_bar(position = "fill", stat = "identity") +
+  scale_y_continuous() + 
+  # add line
+  geom_line(data=global, aes(x = as.numeric(sample), y=mCG),
+            show.legend = FALSE, inherit.aes = FALSE) +
+  # Add points for line
+  geom_point(data=global, aes(x = as.numeric(sample), y=mCG),
+             show.legend = FALSE, inherit.aes = FALSE) +
+  # X axis label
+  xlab(label = "") + 
+  # Y axis label
+  ylab(label = "mCG/CG") +
+  #theme with white background
+  theme_bw() +
+  #eliminates background, gridlines, and chart border
+  theme( axis.text.x = element_text(angle = 90, hjust = 1, size = 15)
+         ,plot.background = element_blank()
+         ,panel.grid.major = element_blank()
+         ,panel.grid.minor = element_blank()
+         ,panel.border = element_blank()
+  ) +
+  #draws x and y axis line
+  theme(axis.line = element_line(color = 'black')) +
+  # Edit legend
+  scale_fill_manual(values = cbPalette, name="mCG/CG level",
+                    labels=c("No (mCG/CG = 0) ",
+                             "Low (mCG/CG >0 and <0.2)",
+                             "Intermediate (mCG/CG >0.2 and <0.8)",
+                             "High (mCG/CG > 0.8)"))
+ggsave(filename = "Owenia_dev_mCGproportion.pdf", height = 25, width = 25, units = "cm")
+
+# Calculate non-conversion rates
+
+readRDS("Owenia_gastrula.lambda.rds") %>% summarise(sum(C_reads), sum(CT_reads))
+nonCovGastrula <- readRDS("Owenia_gastrula.lambda.rds") %>% dplyr::select(C_reads,CT_reads) %>% colSums()
+nonCovGastrula <- nonCovGastrula[1]/nonCovGastrula[2]
+readRDS("Owenia_larva.lambda.rds") %>% summarise(sum(C_reads), sum(CT_reads))
+nonCovLarva <- readRDS("Owenia_larva.lambda.rds") %>% dplyr::select(C_reads,CT_reads) %>% colSums()
+nonCovLarva <- nonCovLarva[1]/nonCovLarva[2]
+readRDS("Owenia_adult.mito.rds") %>% summarise(sum(C_reads), sum(CT_reads))
+nonCovAdult <- readRDS("Owenia_adult.mito.rds") %>% dplyr::select(C_reads,CT_reads) %>% colSums()
+nonCovAdult <- nonCovAdult[1]/nonCovAdult[2]
+readRDS("Owenia_oocyte.lambda.rds") %>% summarise(sum(C_reads), sum(CT_reads))
+
+######################################################################
+## Calculate genes mCG at each loci
+######################################################################
+# Import the bsseq object:
+owe_dev_bs_obj <- readRDS("OweniaMethylomesBSseq.obj.rds") #if not in the environment already
+
+# Functions to read befile and turn it into a Genomic Ranges object:
+read_bed6_to_GRobject <- function(bedfile, chr_append = F){
+  dat <- fread(bedfile)
+  if (chr_append == T){
+    dat$V1 <- paste0("chr",dat$V1)
+  }
+  #dat <- dat[dat$V1 %in% names(sLengths),]
+  if (sum(grepl(unique(dat$V6), pattern = "C")) == 1){
+    dat$V6 <- ifelse(dat$V6 == "C", yes = "-","+")
+  }
+  gr <- GRanges(seqnames = Rle(dat$V1),
+                ranges = IRanges(start = dat$V2, end = dat$V3),
+                strand = dat$V6, 
+                gene_id = dat$V5, target_id = dat$V4)
+  return(gr)
+}
+
+# Function to add loci information to the Genomic Ranges object:
+add_loci <- function(gr){
+  
+  loci <- paste0(seqnames(gr),":", start(gr),"-",end(gr))
+  
+  gr$loci <- loci
+  
+  return(gr)
+  
+}
+
+# The following function takes a bsseq object (methylation) and a genomic ranges object (genes)
+# it computes the mean coverage on CpGs, number of CpGs in each feature, and the region methylation level
+# the methylation is computed as a weighted average across the full gene (or genomic feature)
+get_mC_on_ranges <- function(bs_obj, gene_gr){
+  coverage_positions <- getCoverage(bs_obj, regions = gene_gr, type = "Cov", what = "perBase")
+  position_per_gene <- lapply(coverage_positions, FUN = length) %>% unlist()
+  mean_coverage_gastrula <- getCoverage(bs_obj, regions = gene_gr, type = "Cov", what = "perRegionAverage")[,1]
+  mean_coverage_larva <- getCoverage(bs_obj, regions = gene_gr, type = "Cov", what = "perRegionAverage")[,2]
+  mean_coverage_adult <- getCoverage(bs_obj, regions = gene_gr, type = "Cov", what = "perRegionAverage")[,3]
+  M <- getCoverage(bs_obj, regions = gene_gr, type = "M", what = "perRegionTotal")
+  C <- getCoverage(bs_obj, regions = gene_gr, type = "Cov", what = "perRegionTotal")
+  mCG_on_gastrula <- (M/C)[,1]
+  mCG_on_larva <- (M/C)[,2]
+  mCG_on_adult <- (M/C)[,3]
+  
+  rm(M,C)
+  df <- data.frame(gene_id = gene_gr$target_id,
+                   gene_length = width(gene_gr),
+                   mean_coverage_gastrula = mean_coverage_gastrula,
+                   mean_coverage_larva = mean_coverage_larva,
+                   mean_coverage_adult = mean_coverage_adult,
+                   CpGs = position_per_gene,
+                   loci = add_loci(gene_gr) %>% .$loci,
+                   mCG_on_gastrula = mCG_on_gastrula, 
+                   mCG_on_larva= mCG_on_larva,
+                   mCG_on_adult = mCG_on_adult)
+  return(df)
+}
+
+owenia_genes <- read_bed6_to_GRobject("~/PATH/Owenia_annotation_v250920_longestIsoform.gene.bed")
+owenia_genes_mCG <- get_mC_on_ranges(bs_obj = owe_dev_bs_obj, gene_gr = owenia_genes)
+
+# Save as RDS object and as text file:
+saveRDS(object = owenia_genes_mCG, file = "01-Owenia_Genes_mCG_GRanges.rds")
+write.table(x = owenia_genes_mCG, file = "01-Owenia_genes_mCG.txt", 
+            quote = FALSE, sep = "\t", row.names = FALSE, col.names = TRUE)
+
+# filter genes for coverage (at least 4x in the example depending on distribution of the data)
+# and minimal number of CpGs (the genes should at least cover 30 CpGs)
+owenia_genes_mCG_filtered <- owenia_genes_mCG %>% 
+  dplyr::filter(CpGs >= 30, 
+                mean_coverage_adult >= 4, mean_coverage_gastrula >= 4, mean_coverage_larva >= 4)
+# This table should be easier to work with from here on!
+
+# Obtain a genic bed file which contains mCG coverage for deepTools
+# To do this, use genomic features to extract genic features from genome annotation and intersect it with the gene IDs in the "owenia_genes_mCG_filt" dataset
+owenia <- GenomicFeatures::makeTxDbFromGFF("~/PATH/Owenia_annotation_v250920.1_filtered_noGeneID.gff3",format="auto")
+genes <- GenomicFeatures::genes(owenia)
+genes <- genes %>% data.frame() %>% .[,c(1,2,3,6,6,5)] #amend the df to reflect bed file format
+
+#subset the new data frame based on the gene id that has been filtered for coverage
+owenia.gene.mCG.bed <- genes %>% filter(genes$gene_id %in% owenia_genes_mCG_filtered$gene_id)
+write.table(owenia.gene.mCG.bed[,c("seqnames", "start", "end", "gene_id", "gene_id", "strand")], file = "owenia.genes.mCG.bed", 
+            quote = F, sep = "\t", col.names = FALSE, row.names = FALSE)
+
+# Run the following using deepTools
+# computeMatrix scale-regions -S ofus.gastrula.WGBS.mCG.bw ofus.larva.WGBS.mCG.bw ofus.adult.WGBS.mCG.bw -R owenia.genes.mCG.bed -a 3000 -b 3000 -m 3000 --binSize 100 -o owenia_dev.genebody.heatmap.gz
+#CD5C5C - Indian red colour code
+# plotHeatmap -m owenia_dev.genebody.heatmap.gz -o owenia_dev.genebody.heatmap.pdf --interpolationMethod nearest --zMin 0 --zMax 100  --yMin 0 --yMax 40 --colorList "white,#CD5C5C" --missingDataColor="silver" --heatmapHeight 15 --heatmapWidth 3 --boxAroundHeatmaps no
+
+
+######################################################################
+## Gene body mCG comparison across development
+######################################################################
+
+# get mCG values only
+genes_mCG_mtx <- owenia_genes_mCG_filt %>% dplyr::select(gene_id, mCG_on_gastrula, mCG_on_larva, mCG_on_adult) %>%
+  mutate(mCG_on_gastrula = ifelse(mCG_on_gastrula - nonCovGastrula > 0, mCG_on_gastrula - nonCovGastrula, 0),
+         mCG_on_larva = ifelse(mCG_on_larva - nonCovLarva > 0, mCG_on_larva - nonCovLarva, 0),
+         mCG_on_adult = ifelse(mCG_on_adult - nonCovAdult > 0, mCG_on_adult - nonCovAdult, 0))
+
+
+# genes that change at least 2x the average difference
+hyper_gastrula <- owenia_genes_mCG_filt %>% filter(mCG_on_gastrula - mCG_on_larva > 0.2) %>% .$gene_id
+hypo_gastrula <- owenia_genes_mCG_filt %>% filter(mCG_on_larva - mCG_on_gastrula > 0.2) %>% .$gene_id
+hypo_adult <- owenia_genes_mCG_filt %>% filter(mCG_on_larva - mCG_on_adult > 0.2) %>% .$gene_id
+hyper_adult <- owenia_genes_mCG_filt %>% filter(mCG_on_adult - mCG_on_larva > 0.2) %>% .$gene_id
+demethylated_adult <- owenia_genes_mCG_filt %>% filter(mCG_on_larva - mCG_on_adult > 0.2, mCG_on_adult < 0.05) %>% .$gene_id
+
+
+genes_mCG_mtx$GeneType <- ifelse(genes_mCG_mtx$gene_id %in% hyper_adult, "Hyper_adult",
+                                 ifelse(genes_mCG_mtx$gene_id %in% hypo_adult,"Hypo_adult","low change")) 
+
+genes_mCG_mtx$GeneType2 <- ifelse(genes_mCG_mtx$gene_id %in% hyper_adult, "Hyper_adult",
+                                 ifelse(genes_mCG_mtx$gene_id %in% demethylated_adult,"Demethylated_adult",
+                                        ifelse(genes_mCG_mtx$gene_id %in% hypo_adult,"Moderate_Hypomethylated_adult","low change"))) 
+
+genes_mCG_mtx$col <- ifelse(genes_mCG_mtx$GeneType == "Hyper_adult","Orange",
+                                 ifelse(genes_mCG_mtx$GeneType == "Hypo_adult","Red","Black"))
+
+gg_gastrula_to_larva <- ggplot(genes_mCG_mtx, aes(x = 100*mCG_on_gastrula, y = 100*mCG_on_larva)) + 
+  geom_point(alpha = 0.4) +
+  theme_bw() +
+  geom_smooth(method=lm, se=FALSE, linetype="dashed",
+              color="darkred") +
+  geom_abline(slope = 1, colour='blue') +
+  xlab("mCG % gastrula") +
+  ylab("mCG % larva") +
+  ggtitle(paste0("Owenia gene body mCG comparison Gastrula vs Larva\n(Pearson r =",
+                 round(cor(genes_mCG_mtx$mCG_on_gastrula,genes_mCG_mtx$mCG_on_larva ),digits = 2 ), 
+                 ", n = ",nrow(genes_mCG_mtx),")" ))
+
+gg_larva_to_adult <- ggplot(genes_mCG_mtx, aes(x = 100*mCG_on_larva, y = 100*mCG_on_adult,color = GeneType)) + 
+  geom_point(alpha = 0.4) +
+  scale_colour_manual(breaks = genes_mCG_mtx$GeneType, 
+                      values = genes_mCG_mtx$col) +
+  theme_bw() +
+  geom_smooth(method=lm, se=FALSE, linetype="dashed",
+              color="darkred") +
+  xlab("mCG % larva") +
+  ylab("mCG % adult") +
+  geom_abline(slope = 1, colour='blue') +
+  ggtitle(paste0("Owenia gene body mCG comparison Larva vs Adult\n(Pearson r =",
+                 round(cor(genes_mCG_mtx$mCG_on_larva,genes_mCG_mtx$mCG_on_adult, use = "complete.obs" ),digits = 2 ), 
+                 ", n = ",nrow(genes_mCG_mtx),")" ))
+
+gg_gene_mCG_comparison <- plot_grid(gg_gastrula_to_larva, gg_larva_to_adult, cols = 1)
+ggsave(gg_gene_mCG_comparison, filename = "gg_gene_mCG_comparison.pdf",
+       width = 5, height = 12)
+
+
+############################################################################
+### Correlation with gene expression
+############################################################################
+
+owenia_tpm <- fread("all_Ofus_TPM.txt") %>% data.frame()
+owenia_tx_names <- str_split(owenia_tpm$Gene_ID, pattern = "\\.", simplify = T)%>% data.frame()
+rownames(owenia_tpm) <- owenia_tx_names$X1
+
+owenia_tpm <- owenia_tpm %>% select(-Gene_ID)
+
+owenia_expression <- data.frame(gene_id = rownames(owenia_tpm), 
+                              mean_tpm = rowMeans(owenia_tpm),
+                              coef_var = apply(owenia_tpm,1, sd, na.rm = TRUE)/rowMeans(owenia_tpm) * 100,
+                              gastrula_TPM = owenia_tpm$GL_TPM,
+                              larva_TPM = owenia_tpm$ML_TPM,
+                              juvenile_TPM = owenia_tpm$owe_JV_R1)
+
+owenia_expression <- inner_join(owenia_genes_mCG_filt, owenia_expression) 
+
+owenia_expression <- owenia_expression[rowSums(is.na(owenia_expression)) == 0,]
+
+# classify genes according to deciles of expression
+owenia_expression$decile_tpm <- cut(owenia_expression$mean_tpm, breaks = c(0,quantile(owenia_expression$mean_tpm[owenia_expression$mean_tpm >= 1], seq(0, 1, length = 11), type = 5)),
+                                  labels = c("No expr.","0-10%","10-20%","20-30%","30-40%","40-50%","50-60%","60-70%","70-80%","80-90%","90-100%"))
+
+owenia_expression$decile_tpm_gastrula <- cut(owenia_expression$gastrula_TPM, breaks = c(0,quantile(owenia_expression$gastrula_TPM[owenia_expression$gastrula_TPM >= 1], seq(0, 1, length = 11), type = 5)),
+                                    labels = c("No expr.","0-10%","10-20%","20-30%","30-40%","40-50%","50-60%","60-70%","70-80%","80-90%","90-100%"))
+
+owenia_expression$decile_tpm_larva <- cut(owenia_expression$larva_TPM, breaks = c(0,quantile(owenia_expression$larva_TPM[owenia_expression$larva_TPM >= 1], seq(0, 1, length = 11), type = 5)),
+                                    labels = c("No expr.","0-10%","10-20%","20-30%","30-40%","40-50%","50-60%","60-70%","70-80%","80-90%","90-100%"))
+
+owenia_expression$decile_tpm_adult <- cut(owenia_expression$juvenile_TPM, breaks = c(0,quantile(owenia_expression$juvenile_TPM[owenia_expression$juvenile_TPM >= 1], seq(0, 1, length = 11), type = 5)),
+                                    labels = c("No expr.","0-10%","10-20%","20-30%","30-40%","40-50%","50-60%","60-70%","70-80%","80-90%","90-100%"))
+
+# classify genes according to coeficient of variation
+owenia_expression$decile_cv <- cut(owenia_expression$coef_var, breaks = c(0,quantile(owenia_expression$coef_var[owenia_expression$coef_var >= 1], seq(0, 1, length = 11), type = 5)),
+                                 labels = c("No expr.","0-10%","10-20%","20-30%","30-40%","40-50%","50-60%","60-70%","70-80%","80-90%","90-100%"))
+
+
+# expression vs mCG per stage
+
+g1 <- ggplot(owenia_expression %>% filter(!is.na(decile_tpm_gastrula)), aes(x = decile_tpm_gastrula, y = 100*mCG_on_gastrula)) + 
+  geom_hline(yintercept=75, linetype="dashed", color = "grey") +
+  geom_boxplot(outlier.shape = NA) + 
+  theme(axis.title.x=element_blank(),axis.text.x = element_text(angle = 90),legend.position="none") + ylim(c(0,100)) +
+  theme_classic() + ylab("gastrula mCG %") + xlab("Gene expression decile (low to high)") +
+  ggtitle(paste0("Owenia gene body mCG vs Txn (n=",nrow(owenia_expression %>% filter(!is.na(decile_tpm_gastrula))),")"))
+g2 <- ggplot(owenia_expression %>% filter(!is.na(decile_tpm_larva)), aes(x = decile_tpm_larva, y = 100*mCG_on_larva)) + 
+  geom_hline(yintercept=75, linetype="dashed", color = "grey") +
+  geom_boxplot(outlier.shape = NA) + 
+  theme(axis.title.x=element_blank(),axis.text.x = element_text(angle = 90),legend.position="none") + ylim(c(0,100)) +
+  theme_classic() + ylab("larva mCG %") + xlab("Gene expression decile (low to high)") +
+  ggtitle(paste0("Owenia gene body methylation vs transcription (n=",nrow(owenia_expression %>% filter(!is.na(decile_tpm_larva))),")"))
+g3 <- ggplot(owenia_expression %>% filter(!is.na(decile_tpm_adult)), aes(x = decile_tpm_adult, y = 100*mCG_on_adult)) + 
+  geom_hline(yintercept=75, linetype="dashed", color = "grey") +
+  geom_boxplot(outlier.shape = NA) + 
+  theme(axis.title.x=element_blank(),axis.text.x = element_text(angle = 90),legend.position="none") + ylim(c(0,100)) +
+  theme_classic() + ylab("adult mCG %") + xlab("Gene expression decile (low to high)") +
+  ggtitle(paste0("Owenia gene body methylation vs transcription (n=",nrow(owenia_expression %>% filter(!is.na(decile_tpm_adult))),")"))
+
+gg_expression_vs_genemCG_stage <- plot_grid(g1,g2,g3, ncol = 1)
+ggsave(gg_expression_vs_genemCG_stage, filename = "OweniaExpressionVsGeneBodyMethylation_staged.pdf",
+       width = 6, height = 7)
+
+# coef of variation vs mCG per stage
+g4 <- ggplot(owenia_expression[owenia_expression$decile_cv != "No expr.",], aes(x = decile_cv, y = 100*mCG_on_gastrula)) + 
+  geom_hline(yintercept=75, linetype="dashed", color = "grey") +
+  geom_boxplot(outlier.shape = NA) + 
+  theme(axis.title.x=element_blank(),axis.text.x = element_text(angle = 90),legend.position="none") + ylim(c(0,100)) +
+  theme_classic() + ylab("gastrula mCG %") + xlab("Gene coeficient of variation (low to high)") +
+  ggtitle("Owenia gene body methylation vs transcriptional stability")
+g5 <- ggplot(owenia_expression[owenia_expression$decile_cv != "No expr.",], aes(x = decile_cv, y = 100*mCG_on_larva)) + 
+  geom_hline(yintercept=75, linetype="dashed", color = "grey") +
+  geom_boxplot(outlier.shape = NA) + 
+  theme(axis.title.x=element_blank(),axis.text.x = element_text(angle = 90),legend.position="none") + ylim(c(0,100)) +
+  theme_classic() + ylab("larva mCG %") + xlab("Gene coeficient of variation (low to high)") +
+  ggtitle("Gene body methylation vs transcriptional stability")
+g6 <- ggplot(owenia_expression[owenia_expression$decile_cv != "No expr.",], aes(x = decile_cv, y = 100*mCG_on_adult)) + 
+  geom_hline(yintercept=75, linetype="dashed", color = "grey") +
+  geom_boxplot(outlier.shape = NA) + 
+  theme(axis.title.x=element_blank(),axis.text.x = element_text(angle = 90),legend.position="none") + ylim(c(0,100)) +
+  theme_classic() + ylab("adult mCG %") + xlab("Gene coeficient of variation (low to high)") +
+  ggtitle("Owenia gene body methylation vs transcriptional stability")
+
+gg_coefVar_vs_genemCG_stage <- plot_grid(g4,g5,g6, ncol = 1)
+ggsave(gg_coefVar_vs_genemCG_stage, filename = "OweniaCoefVarTxnVsGeneBodyMethylation_staged.pdf",
+       width = 6, height = 7)
+
+
+############################################################
+### Call DMRs
+############################################################
+library(DSS)
+
+# Perform the DML test
+dmlTest_larva <- DMLtest(owe_dev_bs_obj, group1="ofus_gastrula_WGBS", group2="ofus_larva_WGBS", smoothing=TRUE, smoothing.span=100, BPPARAM = MulticoreParam(1))
+# Call DMRs
+dmrs_larva <- callDMR(dmlTest_larva, delta=0.2, p.threshold=0.05, minCG=5, dis.merge=100)
+
+write.table(dmrs_larva, file = "DSSdmrs_Ofus_gastrula_larva.tsv", quote = F, row.names = F, sep = "\t")
+
+# Perform the DML test
+dmlTest_adult <- DMLtest(owe_dev_bs_obj, group1="ofus_larva_WGBS", group2="ofus_adult_WGBS", smoothing=TRUE, smoothing.span=100, BPPARAM = MulticoreParam(1))
+# Call DMRs
+dmrs_adult <- callDMR(dmlTest_adult, delta=0.2, p.threshold=0.05, minCG=5, dis.merge=100)
+
+write.table(dmrs_adult, file = "DSSdmrs_Ofus_larva_adult.tsv", quote = F, row.names = F, sep = "\t")
+
+
+# load DMRs
+dmrs_larva <- fread("DSSdmrs_Ofus_gastrula_larva.tsv")
+dmrs_adult <- fread("DSSdmrs_Ofus_larva_adult.tsv")
+
+# Turn DMR files into GRanges objects
+from_DMR_to_GR <- function(dmrfile){
+  gr <- GRanges(seqnames = dmrfile$chr, 
+          ranges = IRanges(start = dmrfile$start, end = dmrfile$end),
+          length = dmrfile$length, areaStat = dmrfile$areaStat)
+  gr$target_id <- add_loci(gr) %>% .$loci
+  return(gr)
+}
+
+dmrs_larva_gr <- from_DMR_to_GR(dmrs_larva)
+dmrs_adult_gr <- from_DMR_to_GR(dmrs_adult)
+
+
+# filter DMRs: 
+dmrs_larva_CG <- get_mC_on_ranges(bs_obj = owe_dev_bs_obj, gene_gr = dmrs_larva_gr)
+dmrs_larva_CG_filt <- dmrs_larva_CG %>% filter(mean_coverage_larva >= 4, 
+                                               mean_coverage_gastrula >= 4,
+                                               abs(mCG_on_gastrula - mCG_on_larva) >= 0.2) %>%
+  mutate(status = ifelse(mCG_on_gastrula - mCG_on_larva > 0, "Hypo_larva","Hyper_larva" ),
+                        comparison = "Gastrula_vs_Larva", species = "Owenia")
+
+
+dmrs_adult_CG <- get_mC_on_ranges(bs_obj = owe_dev_bs_obj, gene_gr = dmrs_adult_gr)
+dmrs_adult_CG_filt <- dmrs_adult_CG %>% filter(mean_coverage_larva >= 4, 
+                                               mean_coverage_adult >= 4,
+                                               abs(mCG_on_larva - mCG_on_adult) >= 0.2) %>%
+  mutate(status = ifelse(mCG_on_larva - mCG_on_adult > 0, "Hypo_adult","Hyper_adult" ),
+          comparison = "Larva_vs_Adult", species = "Owenia")
+
+
+write.table(dmrs_larva_CG_filt, file = "DSSdmrs_Ofus_gastrula_larva.filt.tsv", quote = F, row.names = F, sep = "\t")
+write.table(dmrs_adult_CG_filt, file = "DSSdmrs_Ofus_larva_adult.filt.tsv", quote = F, row.names = F, sep = "\t")
+
+
+
+### Read the files (if not in environment)
+
+dmrs_larva_CG_filt <- fread("DSSdmrs_Ofus_gastrula_larva.filt.tsv")
+dmrs_adult_CG_filt <- fread("DSSdmrs_Ofus_larva_adult.filt.tsv")
+
+# Combine the files
+all_dmrs_gr <- c(dmrs_adult_gr,dmrs_larva_gr ) %>% GenomicRanges::reduce()
+# Filter range for methylation coverage
+all_dmrs_CG <- get_mC_on_ranges(bs_obj = owe_dev_bs_obj, gene_gr = all_dmrs_gr)
+all_dmrs_CG_filt <- all_dmrs_CG %>% filter(mean_coverage_gastrula >= 3,
+                                           mean_coverage_larva >= 3, 
+                                               mean_coverage_adult >= 3)
+
+
+############################################################################
+### Classify DMRs
+############################################################################
+
+library(GenomicFeatures)
+library(regioneR)
+
+genePath <- "~/PATH/Owenia_annotation_v250920_longestIsoform.gff3"
+txdb <- makeTxDbFromGFF(file = genePath)
+#promoters extracted by transcript, not gene, to take into account alternative promoters
+transcripts <- transcriptsBy(x = txdb, by = "gene")
+promoters <- promoters(genes, upstream = 2000, downstream = 200)
+genes <- genes(txdb)
+introns <- intronicParts(txdb = txdb)
+exons <- exonsBy(txdb) %>% unlist()
+
+mcols(introns) <- NULL
+introns$class <- "Intron"
+mcols(exons) <- NULL
+exons$class <- "Exon"
+promoters_x <- promoters
+mcols(promoters_x) <- NULL
+promoters_x$class <- "Promoters"
+
+# Obtain ATAC peaks from https://github.com/ChemaMD/OweniaGenome
+# Read the file
+ATAC_peaks <- fread("Owenia_fusiformis_consensus_peaks.bed") %>% 
+  mutate(GR = paste0(V1,":",V2,"-",V3)) %>% .$GR %>% GRanges()
+
+distal_regulatory <- ATAC_peaks[!overlapsAny(ATAC_peaks,promoters_x)]
+#mcols(distal_regulatory) <- NULL
+distal_regulatory$class <- "Distal_ATACpeak"
+
+owenia_te_gr <- read_bed6_to_GRobject("Owenia.RepeatModeler2.bed")
+
+overlap_with_features <- function(gr, rangename){
+  mcols(gr) <- NULL
+  
+  
+  gr$TE <- overlapsAny(gr, owenia_te_gr)
+  
+  gr$promoter <- overlapsAny(gr, promoters_x)
+  
+  gr$enhancer <- overlapsAny(gr, distal_regulatory)
+  
+  gr$exon <- overlapsAny(gr, exons)
+  
+  gr$intron <- overlapsAny(gr, introns)
+  
+  features <- data.frame(mcols(gr)) %>% mutate(category = ifelse(promoter, "Promoter", 
+                                                                 ifelse(enhancer, "DistalATAC",
+                                                                        ifelse(exon, "Exon", 
+                                                                               ifelse(intron, "Intron","Intergenic")))),
+                                               categoryTE= ifelse(TE, "Transposable Element","noTE")) %>%
+    dplyr::select(category, categoryTE)
+  df <- table(features) %>% data.frame() %>% mutate(ranges = rangename)
+  return(df)
+}
+
+dmrs_Hyper_adult_filt_gr<- dmrs_adult_gr[dmrs_adult_gr$target_id %in% dmrs_adult_CG_filt$loci[dmrs_adult_CG_filt$status == "Hyper_adult"]]
+dmrs_Hypo_adult_filt_gr<- dmrs_adult_gr[dmrs_adult_gr$target_id %in% dmrs_adult_CG_filt$loci[dmrs_adult_CG_filt$status == "Hypo_adult"]]
+dmrs_Hyper_larva_filt_gr<- dmrs_larva_gr[dmrs_larva_gr$target_id %in% dmrs_larva_CG_filt$loci[dmrs_larva_CG_filt$status == "Hyper_larva"]]
+dmrs_Hypo_larva_filt_gr<- dmrs_larva_gr[dmrs_larva_gr$target_id %in% dmrs_larva_CG_filt$loci[dmrs_larva_CG_filt$status == "Hypo_larva"]]
+
+
+overlap_with_features(gr = dmrs_adult_filt_gr, rangename = "DMR_adult")
+
+overlaps_to_plot <- rbind(overlap_with_features(gr = dmrs_Hyper_adult_filt_gr, rangename = "Hypermethylated adult DMRs"),
+                          overlap_with_features(gr = dmrs_Hypo_adult_filt_gr, rangename = "Hypomethylated adult DMRs"),
+                          overlap_with_features(gr = dmrs_Hyper_larva_filt_gr, rangename = "Hypermethylated larva DMRs"),
+                          overlap_with_features(gr = dmrs_Hypo_larva_filt_gr, rangename = "Hypomethylated larva DMRs"))
+
+
+overlaps_to_plot$category <- factor(overlaps_to_plot$category, levels = rev(c("Promoter","DistalATAC","Exon","Intron","Intergenic")))
+overlaps_to_plot$ranges <- factor(overlaps_to_plot$ranges, levels = c("Hypermethylated larva DMRs","Hypomethylated larva DMRs","Hypermethylated adult DMRs","Hypomethylated adult DMRs"))
+overlaps_to_plot <- overlaps_to_plot %>% mutate( status = ifelse(grepl(ranges, pattern = "adult"), "larva vs adult","gastrula vs larva"),
+                                                 Freq_sided = ifelse(grepl(ranges, pattern = "Hyper"), Freq,Freq*-1))
+
+
+gg_overlap_DMRs <- ggplot(data = overlaps_to_plot, aes(x = category,y = Freq_sided, fill = categoryTE)) + 
+  geom_bar(position = "stack", stat = "identity") +
+  scale_y_continuous() + 
+  theme_bw() + xlab("") + ylab("Number of DMRs") +
+  scale_fill_manual(values = cbPalette) +
+  ylim(c(-2000,500)) +
+  geom_hline(yintercept=0, linetype="dotted", size = 0.6) +
+  ggtitle("Owenia DMRs features") +
+  coord_flip() + facet_grid(.~status)
+
+ggsave(gg_overlap_DMRs, filename = "OverlapDMRs_features.pdf", width = 8.5, height = 2)
+
+
+############################################################################
+### GO Enrichment of promoter DMR
+############################################################################
+library(topGO)
+library(writexl)
+# Correlate the the transcriptional activity with DMRs that overlap promoters
+
+# Import files and run GO analysis:
+
+# Function to run GO analysis:
+run_go_analysis <- function(data, geneUniverse, annFUN.gene2GO, geneID2GO) {
+  
+  cluster_names <- as.character(data$Gene_ID)
+  cluster_list_for_GO <- as.factor(as.integer(geneUniverse %in% cluster_names))
+  names(cluster_list_for_GO) <- geneUniverse
+  
+  cluster_GOdata_BP <- new("topGOdata", description="cluster_program",
+                           ontology="BP", allGenes=cluster_list_for_GO,
+                           annot = annFUN.gene2GO, gene2GO = geneID2GO) 
+  cluster_resultFisher_BP <- runTest(cluster_GOdata_BP,
+                                     algorithm="classic", statistic="fisher")
+  
+  results_cluster <- GenTable(cluster_GOdata_BP, classicFisher = cluster_resultFisher_BP, orderBy = "resultFisher", ranksOf = "classicFisher", topNodes = 30)
+  return(results_cluster)
+}
+
+
+# Import species-specific whole genome GO terms universe (geneUniverse)
+# Import Owenia GO terms:
+geneID2GO <- readMappings(file = "Ofus_geneID2GO_topGO_onlyGOgenes.txt")
+geneUniverse <- names(geneID2GO)
+
+# Owenia - gastrula v larva promoter DMR:
+  # hypomethylated
+data <- fread("owenia_larva_hypo_promoterID.txt", header =  F)
+colnames(data) <- c("Gene_ID")
+Hypo_larva_Owenia <- run_go_analysis(data, geneUniverse, annFUN.gene2GO, geneID2GO)
+Hypo_larva_Owenia$Type <- c("hypomethylated promoter in ofus larva")
+
+  # hypermethylated
+data <- fread("00-Raw_Plots/owenia_larva_hyper_promoterID.txt", header =  F)
+colnames(data) <- c("Gene_ID")
+Hyper_larva_Owenia <- run_go_analysis(data, geneUniverse, annFUN.gene2GO, geneID2GO)
+Hyper_larva_Owenia$Type <- c("hypermethylated promoter in ofus larva")
+
+owenia_larva_promoterDMR_GO_results <- rbind(Hypo_larva_Owenia, Hyper_larva_Owenia)
+write_xlsx(owenia_larva_promoterDMR_GO_results, "owenia_larva_promoterDMR_GO_results.xlsx", col_names = TRUE)
+rm(owenia_larva_promoterDMR_GO_results)
+
+# Owenia - larva v adult promoter DMR:
+  # hypomethylated
+data <- fread("owenia_adult_hypo_promoterID.txt", header =  F) #620
+colnames(data) <- c("Gene_ID")
+Hypo_adult_Owenia <- run_go_analysis(data, geneUniverse, annFUN.gene2GO, geneID2GO)
+Hypo_adult_Owenia$Type <- c("hypomethylated promoter in ofus adult")
+
+  # hypermethylated
+data <- fread("owenia_adult_hyper_promoterID.txt", header =  F) #85
+colnames(data) <- c("Gene_ID")
+Hyper_adult_Owenia <- run_go_analysis(data, geneUniverse, annFUN.gene2GO, geneID2GO)
+Hyper_adult_Owenia$Type <- c("hypermethylated promoter in ofus adult")
+
+owenia_adult_promoterDMR_GO_results <- rbind(Hypo_adult_Owenia, Hyper_adult_Owenia)
+write_xlsx(owenia_adult_promoterDMR_GO_results, "owenia_adult_promoterDMR_GO_results.xlsx", col_names = TRUE)
+rm(owenia_adult_promoterDMR_GO_results, geneID2GO, geneUniverse, data)
+
+
+# Run enrichment on GO terms & plot them
+# Function to process the enrichment results to be plotted:
+go_enrichment_func <- function(results_cluster) {
+  goEnrichment <- results_cluster
+  goEnrichment$classicFisher <- as.numeric(goEnrichment$classicFisher)
+  goEnrichment <- goEnrichment[,c("GO.ID","Term","classicFisher")]
+  goEnrichment$Term <- gsub(" [a-z]*\\.\\.\\.$", "", goEnrichment$Term)
+  goEnrichment$Term <- gsub("\\.\\.\\.$", "", goEnrichment$Term)
+  goEnrichment$Term <- paste(goEnrichment$GO.ID, goEnrichment$Term, sep=", ")
+  goEnrichment$Term <- factor(goEnrichment$Term, levels=rev(goEnrichment$Term))
+  return(goEnrichment)
+}
+
+# Function to plot enrichment
+enrichment_barplot <- function(data, title) {
+  ggplot(data, aes(x=Term, y=-log10(classicFisher), fill=Term)) +
+    stat_summary(geom = "bar", fun = mean, position = "dodge") +
+    xlab("Biological process") +
+    ylab("-log10(p-value)") +
+    ggtitle(title) +
+    scale_y_continuous(limits=c(0,30),breaks=round(seq(0,30, by = 2), 1)) +
+    theme_classic() +
+    theme(
+      legend.position='none',
+      legend.background=element_rect(),
+      plot.title=element_text(angle=0, size=12, face="bold", vjust=1),
+      axis.text.x=element_text(angle=0, size=10, hjust=1.10),
+      axis.text.y=element_text(angle=0, size=10, vjust=0.5),
+      axis.title=element_text(size=12),
+      legend.key=element_blank(),     #removes the border
+      legend.key.size=unit(1, "cm"),      #Sets overall area/size of the legend
+      legend.text=element_text(size=12),  #Text size
+      title=element_text(size=12)) +
+    guides(colour=guide_legend(override.aes=list(size=2.5))) +
+    coord_flip()
+}
+
+# ofus larva hypo
+Hypo_larva_OweniaGO_enrichment = go_enrichment_func(Hypo_larva_Owenia)
+Hypo_larva_Owenia_enrichment_plot = enrichment_barplot(Hypo_larva_OweniaGO_enrichment, title = "hypomethylated promoter DMR in ofus larva")
+# the starting number for this plot "10" is arbitrarily assigned - none of the other files above were assigned a number
+save_plot(plot = Hypo_larva_Owenia_enrichment_plot, filename = "Hypo_larva_Owenia_enrichment_plot.pdf",
+          base_height = 8, base_width = 12)
+
+# ofus larva hyper
+Hyper_larva_OweniaGO_enrichment = go_enrichment_func(Hyper_larva_Owenia)
+Hyper_larva_OweniaGO_enrichment_plot = enrichment_barplot(Hyper_larva_OweniaGO_enrichment, title = "hypermethylated promoter DMR in ofus larva")
+save_plot(plot = Hyper_larva_OweniaGO_enrichment_plot, filename = "Hyper_larva_Owenia_enrichment_plot.pdf",
+          base_height = 8, base_width = 12)
+
+
+# ofus adult hypo
+Hypo_adult_OweniaGO_enrichment = go_enrichment_func(Hypo_adult_Owenia)
+Hypo_adult_OweniaGO_enrichment_plot = enrichment_barplot(Hypo_adult_OweniaGO_enrichment, title = "hypomethylated promoter DMR in ofus adult")
+save_plot(plot = Hypo_adult_OweniaGO_enrichment_plot, filename = "10-Hypo_adult_OweniaGO_enrichment_plot.pdf",
+          base_height = 8, base_width = 12)
+
+# ofus adult hyper
+Hyper_adult_OweniaGO_enrichment = go_enrichment_func(Hyper_adult_Owenia)
+Hyper_adult_OweniaGO_enrichment_plot = enrichment_barplot(Hyper_adult_OweniaGO_enrichment, title = "hypermethylated promoter DMR in ofus adult")
+save_plot(plot = Hyper_adult_OweniaGO_enrichment_plot, filename = "10-Hyper_adult_OweniaGO_enrichment_plot.pdf",
+          base_height = 8, base_width = 12)
+
+
+
+############################################################################
+## TE methylation by age
+############################################################################
+
+owenia_te_gr <- add_loci(owenia_te_gr)
+
+owenia_te_gr <- owenia_te_gr[width(owenia_te_gr) > 400]
+owenia_TE_CG <- get_mC_on_ranges(bs_obj = all2_bs_obj, gene_gr = owenia_te_gr)
+
+owenia_TE_CG <- owenia_TE_CG %>% filter(CpGs >= 10, width(GRanges(loci)) > 400)
+
+write.table(owenia_TE_CG, file = "OweniaTEs_mCG.tsv", quote = F, row.names = F, sep = "\t")
+
+owenia_TE_CG_filt <- owenia_TE_CG %>% filter(mean_coverage_gastrula >= 4,
+                                             mean_coverage_larva >= 4, 
+                                             mean_coverage_adult >= 4)
+
+
+owenia_kimura <- fread("Owenia_unmasked_v082020.fasta.Kimura.bed",col.names = c("chr","start","end","TE_family","TE_name","Kimura_divergence"))
+
+owenia_kimura$loci <- paste0(owenia_kimura$chr,":",owenia_kimura$start,"-",owenia_kimura$end)
+
+owenia_kimura <- data.frame(owenia_kimura) %>% filter(width(GRanges(loci)) > 400) %>%
+  mutate(Kimura_category = ifelse(Kimura_divergence < 5, "0-5%",
+                                                                               ifelse(Kimura_divergence < 10, "5-10%",
+                                                                                      ifelse(Kimura_divergence < 15, "10-15%",
+                                                                                             ifelse(Kimura_divergence < 20, "15-20%",
+                                                                                                    ifelse(Kimura_divergence < 25, "20-25%",
+                                                                                                           ifelse(Kimura_divergence < 30, "25-30%",
+                                                                                                                  ifelse(Kimura_divergence < 35, "30-35%",
+                                                                                                                         ifelse(Kimura_divergence < 40, "40-45%",
+                                                                                                                                ">45%")))))))))
+
+owenia_kimura$Kimura_category <- factor(owenia_kimura$Kimura_category, levels = c("0-5%","5-10%","10-15%","15-20%","20-25%","25-30%","30-35%","40-45%",">45%"))
+
+
+
+owenia_kimura$TE_class  <- owenia_kimura$TE_name %>% str_split(., pattern = "/",simplify = T) %>% data.frame() %>% .$X1
+
+
+owenia_kimura <- inner_join(owenia_kimura, owenia_TE_CG_filt %>% dplyr::select(loci, mCG_on_gastrula, mCG_on_larva, mCG_on_adult))
+
+owenia_kimura_TEs <- owenia_kimura %>% filter(TE_class %in% c("DNA","LTR","LINE","RC","Unknown"))
+
+owenia_kimura_TEs$intergenic <- ifelse(overlapsAny(GRanges(owenia_kimura_TEs$loci), owenia_genes),"Genic","Intergenic")
+
+gg_te_age <- ggplot(owenia_kimura_TEs, aes(x = Kimura_category, y = mCG_on_larva, fill = intergenic)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  theme_classic() + 
+  theme( axis.text.x = element_text(angle = 90, hjust = 1, size = 10)
+         ,plot.background = element_blank()
+         ,panel.grid.major = element_blank()
+         ,panel.grid.minor = element_blank()
+         ,panel.border = element_blank()
+  ) +
+  xlab("TE insert Kimura divergence category") +
+  ylab("mCG % (gastrula)") +
+  ggtitle("Owenia TE methylation by age") +
+  facet_grid(.~intergenic)
+
+gg_te_age_adult <- ggplot(owenia_kimura_TEs, aes(x = Kimura_category, y = mCG_on_adult, fill = intergenic)) + 
+  geom_boxplot() + 
+  theme_classic() + 
+  theme( axis.text.x = element_text(angle = 90, hjust = 1, size = 10)
+         ,plot.background = element_blank()
+         ,panel.grid.major = element_blank()
+         ,panel.grid.minor = element_blank()
+         ,panel.border = element_blank()
+  ) +
+  xlab("TE insert Kimura divergence category") +
+  ylab("mCG % (adult)") +
+  ggtitle("Owenia TE methylation by age") +
+  facet_grid(.~intergenic)
+
+
+gg_te_age_class <- ggplot(owenia_kimura_TEs, aes(x = Kimura_category, y = mCG_on_larva, fill = intergenic)) + 
+  geom_boxplot() + 
+  theme_classic() + 
+  theme( axis.text.x = element_text(angle = 90, hjust = 1, size = 9)
+         ,plot.background = element_blank()
+         ,panel.grid.major = element_blank()
+         ,panel.grid.minor = element_blank()
+         ,panel.border = element_blank()
+  ) +
+  xlab("TE insert Kimura divergence category") +
+  ylab("mCG % (gastrula)") +
+  ggtitle("Owenia TE methylation by age") +
+  facet_grid(intergenic~TE_class)
+
+ggsave(gg_te_age, filename = "Owenia_TEs_by_age.pdf", width = 4, height = 2.5)
+ggsave(gg_te_age_adult, filename = "Owenia_TEs_by_age_adult.pdf", width = 4, height = 2.5)
+ggsave(gg_te_age_class, filename = "Owenia_TEsClass_by_age.pdf", width = 7, height = 5)
+
+
+############################################################################
+## Gene body mCG vs TE density
+############################################################################
+
+
+introns <- intronicParts(txdb = txdb)
+introns$TE <- overlapsAny(introns, owenia_te_gr)
+
+intron_with_TE <- values(introns) %>% data.frame() %>% dplyr::select(gene_id, TE)
+intron_with_TE$gene_id <- as.character(intron_with_TE$gene_id)
+intron_with_TE$gene_id <- factor(intron_with_TE$gene_id, levels = unique(intron_with_TE$gene_id))
+
+intron_with_TE <- intron_with_TE %>% group_by(gene_id) %>% summarise(withTE = sum(TE), intronNum = n()) %>% mutate(withTEfrac = withTE/intronNum)
+
+intron_with_TE <- left_join(owenia_genes_mCG_filt, intron_with_TE)
+intron_with_TE$withTE[is.na(intron_with_TE$withTE)] <- 0
+intron_with_TE$intronNum[is.na(intron_with_TE$intronNum)] <- 0
+intron_with_TE$withTEfrac[is.na(intron_with_TE$withTEfrac)] <- 0
+
+
+# Curation of categories
+intron_with_TE <- intron_with_TE %>% 
+  mutate(withTEclass = ifelse(withTE > 0,"intronic TEs","no TEs in introns")) %>%
+  mutate(intron_range = ifelse(intronNum == 0,"0", ifelse(intronNum %in% 1:10,intronNum, ">10"))) %>%
+  mutate(intronTE_range = ifelse(withTE == 0,"0", ifelse(withTE %in% 1:10,withTE, ">10")))
+
+intron_with_TE$intron_range <- factor(intron_with_TE$intron_range, levels = c("0",1:10,">10"))
+intron_with_TE$intronTE_range <- factor(intron_with_TE$intronTE_range, levels = c("0",1:10,">10"))
+
+gg_all_introns <- ggplot(intron_with_TE, aes(x = intron_range, y = 100*mCG_on_gastrula)) + geom_boxplot() + theme_classic() + ylab("mCG % (Gastrula)") + xlab("Introns per gene")
+gg_all_intronsWithTEs <- ggplot(intron_with_TE, aes(x = intronTE_range, y = 100*mCG_on_gastrula)) + geom_boxplot() + theme_classic() + ylab("mCG % (Gastrula)") + xlab("Introns with TEs per gene")
+
+gg_all_intronsbyTE <- ggplot(intron_with_TE, aes(x = intron_range, y = 100*mCG_on_gastrula, fill = withTEclass)) + geom_boxplot() + theme_classic() + ylab("mCG % (Gastrula)") + xlab("Introns per gene")
+
+gg_all_introns <- plot_grid(gg_all_introns, 
+          gg_all_intronsWithTEs, 
+          gg_all_intronsbyTE, ncol = 1 )
+
+ggsave(gg_all_introns, filename = "OweniaGbM_GeneswithIntrons.pdf",
+       height = 7, width = 6)
+
+
+######################################################################
+## Unmethylated Regions (UMR)
+######################################################################
+library(AnnotationDbi)
+library(BSgenome)
+library(GenomicFeatures)
+library(rtracklayer)
+library(MethylSeekR)
+
+# First, create a folder called "owenia" and create a sub-folder within it called "seq_seqdir" which will contain owenia's genome
+# The genome must be converted from a fasta into a 2bit file "faToTwoBit Owenia_unmasked_v082020.fa Owenia_unmasked_v082020.2bit"
+
+# Next, import genome:
+ofus <- GenomicFeatures::makeTxDbFromGFF("Owenia_annotation_v250920.1_filtered_noGeneID.gff3",format="auto")
+# Save this as a database:
+AnnotationDbi::saveDb(ofus,"ofus")
+# Call this database and test different functions:
+ofus <- loadDb(file="ofus")
+columns(ofus) #should populate information on genomic features
+
+#Within the folder, create a "seed_file.txt" with the following information:
+# 2023 version of seed file:
+# Package: OfusTxdb
+# Title: Full genome sequence for Owenia fusiformis N6347
+# Description: Full genome sequence for all scaffolds of Owenia fusiformis N6347 provided by NCBI
+# Version: 1.0.0
+# organism: Owenia fusiformis
+# common_name: Owenia fusiformis
+# genome: 1.0.0
+# provider: NCBI
+# release_date: 2021/09
+# BSgenomeObjname: ofus
+# source_url: https://www.ncbi.nlm.nih.gov/genome/?term=txid6347[Organism:noexp]
+# organism_biocview: AnnotationData, BSgenome
+# SrcDataFiles: Owenia_unmasked_v082020.2bit
+# seqfile_name: Owenia_unmasked_v082020.2bit
+# seqs_srcdir: /Users/chema/Desktop/ofus/seqs_srcdir
+# circ_seqs: character(0)
+
+# Convert the text file into a "dcf" format:
+seed_file <- read.dcf("~/Desktop/ofus/seed_file2023.txt", fields = NULL, all = FALSE, keep.white = NULL)
+write.dcf(seed_file , file = "seed.dcf", append = FALSE, useBytes = FALSE,
+          indent = 0.1 * getOption("width"),
+          width = 0.9 * getOption("width"),
+          keep.white = NULL)
+
+# Unlink to clear the previous forgeBSgenome step:
+unlink(c("OfusTxdb"), recursive = TRUE, force = TRUE)
+# Forge it into a BSgenome package:
+forgeBSgenomeDataPkg("PATH/ofus/seed.dcf", verbose=TRUE)
+
+
+# Open the terminal in R, navigate to the "ofus" folder where all the BSgenome information are stored, and run the following command:
+# R CMD build OfusTxdb
+# R CMD check OfusTxdb_1.0.0.tar.gz -- check the package
+# rm -Rf /var/folders/lq/nqsrgssx11g9bb_w9sh9k0rr0000gq/T//RtmpgEC5Gk/Rd2pdf1073c1d387143
+# R CMD install OfusTxdb_1.0.0.tar.gz
+
+# Once finished, clear the environment and reload the BSgenome as follows:
+library(OfusTxdb)
+ofus_genome <- OfusTxdb
+
+# Use MethylSeek package to extract UMRs using BSgenome object created earlier
+# Import bsseq objects (feed one object at a time into MethylSeek):
+# owe_bs_obj <- readRDS("ofus_gastrula_WGBS.CG_bsseq.rds")
+# owe_bs_obj <- readRDS("ofus_larva_WGBS.CG_bsseq.rds")
+ owe_bs_obj <- readRDS("ofus_adult_WGBS.CG_bsseq.rds")
+
+# Extract rowRanges from the bsseq object and turn it into genomic ranges:
+# Create matrices containing coverage and methylation info that will be compatible with MethylSeek package:
+owe.gr <- owe_bs_obj@rowRanges
+owe.gr$T <- getCoverage(owe_bs_obj, type = "Cov")
+owe.gr$M <- getCoverage(owe_bs_obj, type = "M")
+colSums((owe.gr$M))/colSums((owe.gr$T)) #check global mCG levels before computing UMR just to ensure the name matches the sample
+
+# Obtain LMR/UMRs
+oweniaGastrula.UMRLMRsegments.gr <- segmentUMRsLMRs(m=owe.gr, meth.cutoff=0.5,
+                                                 nCpG.cutoff=4,
+                                                 num.cores=1, myGenomeSeq=ofus_genome,
+                                                 seqLengths=seqlengths(ofus_genome))
+saveRDS(object = oweniaGastrula.UMRLMRsegments.gr, file = "oweniaGastrula.UMRLMRsegments.gr.rds")
+saveUMRLMRSegments(segs=oweniaGastrula.UMRLMRsegments.gr, TableFilename="oweniaGastrula.UMRLMRsegments.bed")
+
+
+oweniaLarva.UMRLMRsegments.gr <- segmentUMRsLMRs(m=owe.gr, meth.cutoff=0.5,
+                                                    nCpG.cutoff=4,
+                                                    num.cores=1, myGenomeSeq=ofus_genome,
+                                                    seqLengths=seqlengths(ofus_genome))
+saveRDS(object = oweniaLarva.UMRLMRsegments.gr, file = "oweniaLarva.UMRLMRsegments.gr.rds")
+saveUMRLMRSegments(segs=oweniaLarva.UMRLMRsegments.gr, TableFilename="oweniaLarva.UMRLMRsegments.bed")
+
+
+oweniaAdult.UMRLMRsegments.gr <- segmentUMRsLMRs(m=owe.gr, meth.cutoff=0.5,
+                                                 nCpG.cutoff=4,
+                                                 num.cores=1, myGenomeSeq=ofus_genome,
+                                                 seqLengths=seqlengths(ofus_genome))
+saveRDS(object = oweniaAdult.UMRLMRsegments.gr, file = "oweniaAdult.UMRLMRsegments.gr.rds")
+saveUMRLMRSegments(segs=oweniaAdult.UMRLMRsegments.gr, TableFilename="oweniaAdult.UMRLMRsegments.bed")
+
+rm(ofus_genome, owe.gr, owe_bs_obj)
+
+
+# Obtain Owenia promoter regions & UMR overlaps
+# Import owenia's annotation 
+owenia <- GenomicFeatures::makeTxDbFromGFF("Owenia_annotation_v250920.1_filtered_noGeneID.gff3",format="auto")
+columns(owenia)
+# Extract promoters
+owenia.promoters <- promoters(owenia)
+
+# Import fai index to obtain sequence lengths to feed into the promoter GRanges:
+genome_fai <- data.table::fread(file = "Owenia_unmasked_v082020.fa.fai")[,c(1,2)]
+sLengths <- genome_fai$V2 #changes into a vector
+names(sLengths) <- genome_fai$V1 #naming the parts of a vector
+
+# Add sequence lengths to the promoter GRanges
+seqlengths(owenia.promoters) <- sLengths[levels(seqnames(owenia.promoters))]
+# Trim the promoters to ensure there are no out of bounds regions/coordinates
+trimmed.promoters <- IRanges::trim(owenia.promoters)
+df <- trimmed.promoters %>% data.frame()
+# Export the trimmed promoter as a bed file:
+rtracklayer::export(trimmed.promoters, "Owenia.trimmed.promoters.bed")
+
+
+#### Intersect with promoter features using BEDTools and obtain motifs using HOMER: 
+# Select UMR lengths up to 5kb
+# awk '$3 - $2 < 5000' owenia.adult.UMRLMR.bed > owenia.adult.UMR5kb.bed
+# bedtools intersect -a owenia.adult.UMR5kb.bed -b Owenia.trimmed.promoters.bed -wa -f 0.8 > owenia.adult.UMR5kb.promoter.bed
+# Run homer
+# findMotifsGenome.pl owenia.adult.UMR5kb.promoter.bed wenia_unmasked_v082020.fa HOMER_output -mset vertebrates -p 12 -size given -len 6,8,10,12
+
+
+
+############################################################################
+## Interspecies differences
+############################################################################
+### read one to one orthologues 
+one2one <- fread("~/Dropbox/05-DNAm/00-DATA/03-RNAseq/Ofus2Ctel_ID.txt") %>%
+  dplyr::select(-Orthogroup)
+
+one2one$Ofus <- str_split(one2one$Ofus, pattern = "\\.", simplify = T)[,1]
+one2one$Ctel <- str_split(one2one$Ctel, pattern = "\\.", simplify = T)[,1]
+
+owenia_genes_to_table <- owenia_genes_mCG_filt %>% dplyr::rename(Ofus = gene_id) %>% 
+  dplyr::select(-CpGs, -mean_coverage_gastrula, -mean_coverage_larva, -mean_coverage_adult, -loci)
+capitella_genes_to_table <- capitella_genes_mCG_filt %>% dplyr::rename(Ctel = gene_id, mCG_Ctel = mCG_on_adult_EMseq) %>% 
+  dplyr::select(-CpGs, -loci,-mean_coverage_gastrula,-mean_coverage_larva,-mean_coverage_adult_EMseq,-mean_coverage_adult)
+
+one2one_mCG <- inner_join(one2one, owenia_genes_to_table)
+one2one_mCG <- inner_join(one2one_mCG, capitella_genes_to_table, by = "Ctel") %>%
+ mutate(similarity = ifelse(abs(mCG_Ctel - mCG_on_adult.x) >= 0.15,"TRUE","FALSE" ))
+
+
+# define hypermethylated categories per each species
+hyperOfus_gastrula <- one2one_mCG %>% filter(mCG_on_gastrula > 0.2, mCG_on_gastrulaEMSeq < 0.1, mCG_on_gastrula - mCG_on_gastrulaEMSeq > 0.25 ) %>% .$Ofus
+hyperCtel_gastrula <- one2one_mCG %>% filter(mCG_on_gastrula < 0.1, mCG_on_gastrulaEMSeq > 0.2, mCG_on_gastrulaEMSeq - mCG_on_gastrula > 0.25 ) %>% .$Ctel
+hyperOfus <- one2one_mCG %>% filter(mCG_on_adult.x > 0.2, mCG_Ctel < 0.1, mCG_on_adult.x - mCG_Ctel > 0.25 ) %>% .$Ofus
+hyperCtel <- one2one_mCG %>% filter(mCG_on_adult.x < 0.1, mCG_Ctel > 0.2, mCG_Ctel - mCG_on_adult.x > 0.25 ) %>% .$Ctel
+
+
+
+one2one_mCG$GeneType <- ifelse(one2one_mCG$Ofus %in% hyperOfus, "Hyper_owenia",
+                                 ifelse(one2one_mCG$Ctel  %in% hyperCtel,"Hyper_capitella","low change")) 
+
+one2one_mCG$GeneTypeGastrula <- ifelse(one2one_mCG$Ofus %in% hyperOfus_gastrula, "Hyper_owenia",
+                               ifelse(one2one_mCG$Ctel  %in% hyperCtel_gastrula,"Hyper_capitella","low change")) 
+
+one2one_mCG$col <- ifelse(one2one_mCG$GeneType == "Hyper_owenia", "Red",
+                               ifelse(one2one_mCG$GeneType  == "Hyper_capitella","Orange","Black")) 
+
+one2one_mCG$colGastrula <- ifelse(one2one_mCG$GeneTypeGastrula == "Hyper_owenia", "Red",
+                          ifelse(one2one_mCG$GeneTypeGastrula  == "Hyper_capitella","Orange","Black")) 
+
+one2one_mCG$Ofus_status <- ifelse(one2one_mCG$mCG_on_adult > 0.1, "Ofus_Methylated","Ofus_Unmethylated")
+one2one_mCG$Ctel_status <- ifelse(one2one_mCG$mCG_Ctel > 0.1, "Ctel_Methylated","Ctel_Unmethylated")
+
+table(one2one_mCG$Ofus_status,one2one_mCG$Ctel_status)
+
+write(one2one_mCG$Ofus[one2one_mCG$GeneType == "Hyper_owenia"], file = "Hyper_mCG_Owenia_vs_Capitella.ids")
+write(one2one_mCG$Ofus[one2one_mCG$GeneType == "Hyper_capitella"], file = "Hyper_mCG_Capitella_vs_Owenia.ids")
+
+
+# Plot gene body mCG
+gg_one2one_gastrula <- ggplot(one2one_mCG, aes(x = 100*mCG_on_gastrula, y = 100*mCG_on_gastrulaEMSeq, color = GeneTypeGastrula)) + 
+  geom_point(alpha = 0.4) +
+  scale_colour_manual(breaks = one2one_mCG$GeneTypeGastrula, 
+                      values = one2one_mCG$colGastrula) +
+  theme_bw() +
+  geom_smooth(method=lm, se=FALSE, linetype="dashed",
+              color="darkred") +
+  geom_abline(slope = 1, colour='blue') +
+  xlab("GbM % Owenia gastrula") +
+  ylab("GbM % Capitella gastrula") +
+  ggtitle(paste0("One to one orthologues mCG comparison\n(Spearman r =",
+                 round(cor(one2one_mCG$mCG_on_gastrula,one2one_mCG$mCG_on_gastrulaEMSeq,method = "spearman" ),digits = 2 ), 
+                 ", n = ",nrow(one2one_mCG),")" ))
+
+ggsave(gg_one2one_gastrula, filename = "One2one_methylation_gastrula.pdf",
+       width = 7, height = 5.5)
+
+gg_one2one <- ggplot(one2one_mCG, aes(x = 100*mCG_on_adult, y = 100*mCG_Ctel, color = GeneType)) + 
+  geom_point(alpha = 0.4) +
+  scale_colour_manual(breaks = one2one_mCG$GeneType, 
+                      values = one2one_mCG$col) +
+    theme_bw() +
+  geom_smooth(method=lm, se=FALSE, linetype="dashed",
+              color="darkred") +
+  geom_abline(slope = 1, colour='blue') +
+  xlab("GbM % Owenia adult") +
+  ylab("GbM % Capitella adult") +
+  ggtitle(paste0("One to one orthologues mCG comparison\n(Spearman r =",
+                 round(cor(one2one_mCG$mCG_on_adult,one2one_mCG$mCG_Ctel,method = "spearman" ),digits = 2 ), 
+                 ", n = ",nrow(one2one_mCG),")" ))
+
+ggsave(gg_one2one, filename = "One2one_methylation.pdf",
+       width = 7, height = 5.5)
+
+############################################################################
+##### Comparison methylation and transcription across species
+############################################################################
+
+comparison_txn <- owenia_expression %>% dplyr::rename(Ofus = gene_id) %>% inner_join(., one2one) %>%
+  inner_join(.,capitella_expression, by = c("Ctel" = "gene_id"))
+
+# compare mCG correlation per stage
+interspecies_correlation_mCG <- data.frame( comparison = c("gastrula","larva","adult"),
+  spearman = c(cor(comparison_txn$mCG_on_gastrula, comparison_txn$mCG_on_gastrulaEMSeq, method = "spearman"),
+   cor(comparison_txn$mCG_on_larva, comparison_txn$mCG_on_larvaEMSeq, method = "spearman"),
+   cor(comparison_txn$mCG_on_adult, comparison_txn$mCG_on_adultEMSeq, method = "spearman"))) %>% 
+  mutate( type = "Gene Body Methylation levels")
+interspecies_correlation_Txn <- data.frame( comparison = c("gastrula","larva","adult"),
+                                            spearman = c(cor(comparison_txn$gastrula_TPM.x, comparison_txn$gastrula_TPM.y, method = "spearman"),
+               cor(comparison_txn$larva_TPM.x, comparison_txn$gastrula_TPM.y, method = "spearman"),
+               cor(comparison_txn$juvenile_TPM, comparison_txn$adult_TPM, method = "spearman"))) %>%
+  mutate( type = "Transcriptional levels")
+
+interspecies_correlation <- rbind(interspecies_correlation_mCG,interspecies_correlation_Txn)
+
+
+# check if Txn correlation is higher for genes with equivalent methylation status
+
+comparison_txn$Ofus_mC_status <- ifelse(comparison_txn$mCG_on_adult > 0.1, "Methylated","Unmethylated")
+comparison_txn$Ctel_mC_status <- ifelse(comparison_txn$mCG_on_adultEMSeq > 0.1, "Methylated","Unmethylated")
+comparison_txn$combo_status <- ifelse(comparison_txn$Ofus_mC_status == "Methylated" & comparison_txn$Ctel_mC_status == "Methylated","Both_methylated",
+                                      ifelse(comparison_txn$Ofus_mC_status == "Unmethylated" & comparison_txn$Ctel_mC_status == "Unmethylated","Both_unmethylated",
+                                             ifelse(comparison_txn$Ofus_mC_status == "Unmethylated" & comparison_txn$Ctel_mC_status == "Methylated","Ctel_hyper","Ofus_hyper")))
+
+
+# Function to quantile normalise TPM
+
+quantile_normalisation <- function(df){
+  df_rank <- apply(df,2,rank,ties.method="min")
+  df_sorted <- data.frame(apply(df, 2, sort))
+  df_mean <- apply(df_sorted, 1, mean)
+  
+  index_to_mean <- function(my_index, my_mean){
+    return(my_mean[my_index])
+  }
+  
+  df_final <- apply(df_rank, 2, index_to_mean, my_mean=df_mean)
+  rownames(df_final) <- rownames(df)
+  return(df_final)
+}
+
+comparison_txn_quantile_normalised <- comparison_txn %>% select(gastrula_TPM.x,larva_TPM.x,juvenile_TPM, gastrula_TPM.y, larva_TPM.y, adult_TPM) %>% quantile_normalisation() %>% data.frame()
+
+compare_to_plot <- data.frame(gene_id = comparison_txn$Ofus, 
+           owenia = as.numeric(comparison_txn_quantile_normalised$gastrula_TPM.x),
+           capitella = as.numeric(comparison_txn_quantile_normalised$gastrula_TPM.y),
+           combo_status = comparison_txn$combo_status) %>% melt()
+
+g1 <- ggplot(compare_to_plot,aes(x = combo_status, y = log10(value), fill = variable) ) + geom_boxplot(outlier.shape = NA) +
+  ylab("Gastrula\nlog10(quantile normalised expression)") + xlab("") +
+  ylim(c(-2,3)) +
+  theme_classic() +
+  theme(axis.title.x=element_blank(),axis.text.x = element_text(angle = 90),legend.position="bottom")
+
+compare_to_plot_coef <- data.frame(gene_id = comparison_txn$Ofus, 
+                              ofus = as.numeric(comparison_txn$coef_var.x),
+                              ctel = as.numeric(comparison_txn$coef_var.y),
+                              combo_status = comparison_txn$combo_status) %>% melt()
+
+g2 <- ggplot(compare_to_plot_coef,aes(x = combo_status, y = value, fill = variable) ) + geom_boxplot(outlier.shape = NA) +
+  ylab("Expression Coeficient of variation") + xlab("") +
+  theme_classic() +
+  theme(axis.title.x=element_blank(),axis.text.x = element_text(angle = 90),legend.position="bottom")
+
+GbMcomparison_plot <- plot_grid(g1,g2, ncol = 1)
+
+ggsave(GbMcomparison_plot, filename = "One2one_transcriptional_differences.pdf",
+       width = 2.5, height = 8)
+
+### Compare genes that lose methylation across development in both species:
+
+hypo_in_both_species <- comparison_txn %>% filter(mCG_on_gastrula - mCG_on_adult >= 0.2 | mCG_on_larva - mCG_on_adult >= 0.2,
+                          mCG_on_gastrulaEMSeq - mCG_on_adultEMSeq >= 0.1 | mCG_on_larvaEMSeq - mCG_on_adultEMSeq >= 0.1) %>% 
+  dplyr::select(Ofus,Ctel)
+
+write.table(hypo_in_both_species, file = "AdultHypo_In_BothSpecies.tsv", quote = F, row.names = F, sep = "\t")
+
+
+## interspecies_correlation_mCG
+
+ctel_correlations <- data.frame( comparison = c("Gastrula","Larva","Adult"),
+                                 spearman = c(cor(capitella_expression$gastrula_TPM, capitella_expression$mCG_on_gastrulaEMSeq, method = "spearman"),
+                                              cor(capitella_expression$larva_TPM, capitella_expression$mCG_on_larvaEMSeq, method = "spearman"),
+                                              cor(capitella_expression$adult_TPM, capitella_expression$mCG_on_adultEMSeq, method = "spearman")),
+                                 pearson = c(cor(capitella_expression$gastrula_TPM, capitella_expression$mCG_on_gastrulaEMSeq, method = "pearson"),
+                                             cor(capitella_expression$larva_TPM, capitella_expression$mCG_on_larvaEMSeq, method = "pearson"),
+                                             cor(capitella_expression$adult_TPM, capitella_expression$mCG_on_adultEMSeq, method = "pearson")) ) %>%
+  mutate(species = "Capitella")
+
+ofus_correlations <- data.frame( comparison = c("Gastrula","Larva","Adult"),
+                                 spearman = c(cor(owenia_expression$gastrula_TPM, owenia_expression$mCG_on_gastrula, method = "spearman"),
+                                              cor(owenia_expression$larva_TPM, owenia_expression$mCG_on_larva, method = "spearman"),
+                                              cor(owenia_expression$juvenile_TPM, owenia_expression$mCG_on_adult, method = "spearman")),
+                                 pearson = c(cor(owenia_expression$gastrula_TPM, owenia_expression$mCG_on_gastrula, method = "pearson"),
+                                             cor(owenia_expression$larva_TPM, owenia_expression$mCG_on_larva, method = "pearson"),
+                                             cor(owenia_expression$juvenile_TPM, owenia_expression$mCG_on_adult, method = "pearson"))  ) %>%
+  mutate(species = "Owenia")
+
+
+dev_txn_mCG_correlations <- rbind(ctel_correlations,ofus_correlations)
+
+dev_txn_mCG_correlations$comparison <- factor(dev_txn_mCG_correlations$comparison, levels = c("Gastrula","Larva","Adult"))
+interspecies_correlation$comparison <- factor(dev_txn_mCG_correlations$comparison, levels = c("Gastrula","Larva","Adult"))
+
+
+gg_corr_dev <- ggplot(dev_txn_mCG_correlations, aes(x = comparison, y = spearman, group = species, color = species)) + geom_line() + geom_point() +
+  theme_classic() + ylab("Spearman Correlation\nGene Body Methylation with Transcription") +
+  xlab("")
+
+ggsave(gg_corr_dev, filename = "Correlation_Trends_dev.pdf",
+       height = 3, width = 4)
+gg_corr_inter <- ggplot(interspecies_correlation, aes(x = comparison, y = spearman, group = type, color = type)) + geom_line() + geom_point() +
+  theme_classic() + ylab("Spearman Correlation\nbetween One-2-One orthologues") +
+  xlab("")  
+
+ggsave(gg_corr_inter, filename = "Correlation_Trends_inter.pdf",
+       height = 3, width = 5)
+
